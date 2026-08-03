@@ -1,0 +1,30 @@
+[package]
+name = "launch_overlay"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "launch_overlay"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+egui = { version = "0.33", default-features = false }
+egui-directx11 = "0.12"
+gif = "0.13"
+rodio = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_System_LibraryLoader",
+] }
