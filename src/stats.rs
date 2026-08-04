@@ -28,7 +28,7 @@ pub unsafe fn check_career_stats() -> bool {
     // 1. Cooldown Check (throttled to avoid log spam every frame)
     if let Ok(guard) = LAST_TRIGGER.lock() {
         if let Some(last_time) = *guard {
-            if last_time.elapsed() < Duration::from_secs(2) {
+            if last_time.elapsed() < Duration::from_secs(30) {
                 return false;
             }
         }

@@ -73,6 +73,7 @@ struct OverlayState {
 
 thread_local! {
     static STATE: RefCell<Option<OverlayState>> = RefCell::new(None);
+    static OVERLAY_ACTIVE: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
 static LOGGED_FIRST_FRAME: OnceLock<()> = OnceLock::new();
@@ -117,8 +118,9 @@ pub unsafe extern "C" fn on_present(swapchain: *mut c_void, _userdata: *mut c_vo
         return;
     }
 
-    // Automatically poll IL2CPP stats every frame!
-    if crate::stats::check_career_stats() {
+    // Only poll IL2CPP stats when overlay isn't already showing, so a
+    // still-matching stat can't retrigger and keep extending active_until.
+    if !OVERLAY_ACTIVE.with(|a| a.get()) && crate::stats::check_career_stats() {
         trigger();
     }
 
@@ -158,6 +160,7 @@ pub unsafe extern "C" fn on_present(swapchain: *mut c_void, _userdata: *mut c_vo
             }
             None => false,
         };
+        OVERLAY_ACTIVE.with(|a| a.set(is_active));
 
         if !is_active {
             return;
