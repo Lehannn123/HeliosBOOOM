@@ -28,7 +28,7 @@ pub unsafe fn check_career_stats() -> bool {
     // 1. Cooldown Check (throttled to avoid log spam every frame)
     if let Ok(guard) = LAST_TRIGGER.lock() {
         if let Some(last_time) = *guard {
-            if last_time.elapsed() < Duration::from_secs(30) {
+            if last_time.elapsed() < Duration::from_secs(60) {
                 return false;
             }
         }
@@ -156,6 +156,84 @@ pub unsafe fn check_career_stats() -> bool {
                     return true;
                 }
             }
+        }
+    }
+
+    // 67% fail-rate check: walk HomeInfo -> TurnInfoListDic ->
+    // [CommandType.Training] -> each training's TrainingFailureRate.
+    let get_home_info_m = class_get_method_from_name(single_mode_class, c("get_HomeInfo").as_ptr(), 0);
+    if get_home_info_m.is_null() {
+        return false;
+    }
+    let home_info = runtime_invoke(get_home_info_m, single_mode, std::ptr::null_mut(), std::ptr::null_mut());
+    if home_info.is_null() {
+        return false;
+    }
+    let home_info_class = object_get_class(home_info);
+
+    let get_turn_dic_m = class_get_method_from_name(home_info_class, c("get_TurnInfoListDic").as_ptr(), 0);
+    if get_turn_dic_m.is_null() {
+        return false;
+    }
+    let turn_dic = runtime_invoke(get_turn_dic_m, home_info, std::ptr::null_mut(), std::ptr::null_mut());
+    if turn_dic.is_null() {
+        return false;
+    }
+    let turn_dic_class = object_get_class(turn_dic);
+
+    let try_get_m = class_get_method_from_name(turn_dic_class, c("TryGetValue").as_ptr(), 2);
+    if try_get_m.is_null() {
+        return false;
+    }
+    let mut key: i32 = 1; // CommandType.Training
+    let mut out_val: *mut c_void = std::ptr::null_mut();
+    let mut params: [*mut c_void; 2] = [
+        &mut key as *mut i32 as *mut c_void,
+        &mut out_val as *mut *mut c_void as *mut c_void,
+    ];
+    runtime_invoke(try_get_m, turn_dic, params.as_mut_ptr(), std::ptr::null_mut());
+    if out_val.is_null() {
+        return false; // not currently on the training screen
+    }
+    let turn_list = out_val;
+    let turn_list_class = object_get_class(turn_list);
+
+    let get_count_m = class_get_method_from_name(turn_list_class, c("get_Count").as_ptr(), 0);
+    let get_item_m = class_get_method_from_name(turn_list_class, c("get_Item").as_ptr(), 1);
+    if get_count_m.is_null() || get_item_m.is_null() {
+        return false;
+    }
+    let count_res = runtime_invoke(get_count_m, turn_list, std::ptr::null_mut(), std::ptr::null_mut());
+    if count_res.is_null() {
+        return false;
+    }
+    let count = *(count_res.add(0x10) as *const i32);
+
+    for i in 0..count {
+        let mut idx = i;
+        let mut item_params: [*mut c_void; 1] = [&mut idx as *mut i32 as *mut c_void];
+        let item = runtime_invoke(get_item_m, turn_list, item_params.as_mut_ptr(), std::ptr::null_mut());
+        if item.is_null() {
+            continue;
+        }
+        let item_class = object_get_class(item);
+        let get_fail_m = class_get_method_from_name(item_class, c("get_TrainingFailureRate").as_ptr(), 0);
+        if get_fail_m.is_null() {
+            continue;
+        }
+        let fail_res = runtime_invoke(get_fail_m, item, std::ptr::null_mut(), std::ptr::null_mut());
+        if fail_res.is_null() {
+            continue;
+        }
+        let fail_rate = *(fail_res.add(0x10) as *const i32);
+        api::log_info(&format!("launch_overlay: training[{i}] fail_rate={fail_rate}"));
+
+        if fail_rate == 67 {
+            api::log_info("launch_overlay: Triggered on 67% fail rate");
+            if let Ok(mut guard) = LAST_TRIGGER.lock() {
+                *guard = Some(Instant::now());
+            }
+            return true;
         }
     }
 
