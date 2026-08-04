@@ -13,6 +13,7 @@ pub enum InitResult {
 type PresentCallback = unsafe extern "C" fn(swapchain: *mut c_void, userdata: *mut c_void);
 
 struct ApiFns {
+    get_api: HachimiGetApiFn,
     log: unsafe extern "C" fn(level: i32, target: *const c_char, message: *const c_char),
     hachimi_register_present_callback:
         unsafe extern "C" fn(Option<PresentCallback>, *mut c_void) -> bool,
@@ -37,6 +38,7 @@ macro_rules! req {
 
 pub fn init(get_api: HachimiGetApiFn) -> bool {
     let fns = ApiFns {
+        get_api,
         log: req!(get_api, "log"),
         hachimi_register_present_callback: req!(get_api, "hachimi_register_present_callback"),
     };
@@ -68,4 +70,13 @@ fn log(level: i32, msg: &str) {
 
 pub fn register_present_callback(cb: PresentCallback) -> bool {
     unsafe { (api().hachimi_register_present_callback)(Some(cb), std::ptr::null_mut()) }
+}
+
+/// Helper function to resolve IL2CPP exported API methods from Hachimi
+pub fn resolve_il2cpp_fn(name: &str) -> *mut c_void {
+    if let Some(api_fns) = API.get() {
+        resolve(api_fns.get_api, name)
+    } else {
+        std::ptr::null_mut()
+    }
 }

@@ -88,7 +88,7 @@ pub fn trigger() {
                 sink.stop();
                 let cursor = Cursor::new(SOUND_BYTES);
                 if let Ok(source) = Decoder::new(cursor) {
-                    sink.set_volume(1.0); // Set max volume (100%)
+                    sink.set_volume(1.0);
                     sink.append(source);
                     sink.play();
                 }

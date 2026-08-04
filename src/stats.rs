@@ -1,122 +1,163 @@
+use crate::api;
 use std::ffi::{c_char, c_void, CString};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use windows::core::PCSTR;
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
-type Il2CppDomainGet = unsafe extern "C" fn() -> *mut c_void;
-type Il2CppDomainGetAssemblies = unsafe extern "C" fn(domain: *mut c_void, size: *mut usize) -> *mut *mut c_void;
-type Il2CppAssemblyGetImage = unsafe extern "C" fn(assembly: *mut c_void) -> *mut c_void;
-type Il2CppClassFromName = unsafe extern "C" fn(image: *mut c_void, namesp: *const c_char, name: *const c_char) -> *mut c_void;
-type Il2CppClassGetMethodFromName = unsafe extern "C" fn(klass: *mut c_void, name: *const c_char, args_count: i32) -> *mut c_void;
-type Il2CppRuntimeInvoke = unsafe extern "C" fn(method: *mut c_void, obj: *mut c_void, params: *mut *mut c_void, exc: *mut *mut c_void) -> *mut c_void;
+static LAST_TRIGGER: Mutex<Option<Instant>> = Mutex::new(None);
 
-struct Il2CppApi {
-    domain_get: Il2CppDomainGet,
-    domain_get_assemblies: Il2CppDomainGetAssemblies,
-    assembly_get_image: Il2CppAssemblyGetImage,
-    class_from_name: Il2CppClassFromName,
-    class_get_method_from_name: Il2CppClassGetMethodFromName,
-    runtime_invoke: Il2CppRuntimeInvoke,
+type DomainGetFn = unsafe extern "C" fn() -> *mut c_void;
+type DomainAssemblyOpenFn = unsafe extern "C" fn(domain: *mut c_void, name: *const c_char) -> *mut c_void;
+type AssemblyGetImageFn = unsafe extern "C" fn(assembly: *mut c_void) -> *mut c_void;
+type ClassFromNameFn = unsafe extern "C" fn(image: *mut c_void, namesp: *const c_char, name: *const c_char) -> *mut c_void;
+type ClassGetMethodFromNameFn = unsafe extern "C" fn(class: *mut c_void, name: *const c_char, args_count: i32) -> *mut c_void;
+type RuntimeInvokeFn = unsafe extern "C" fn(method: *mut c_void, obj: *mut c_void, params: *mut *mut c_void, exc: *mut *mut c_void) -> *mut c_void;
+type ObjectGetClassFn = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
+
+unsafe fn get_il2cpp_export(game_assembly: windows::Win32::Foundation::HMODULE, name: &str) -> *mut c_void {
+    let c_name = CString::new(name).unwrap();
+    if let Some(proc) = GetProcAddress(game_assembly, PCSTR(c_name.as_ptr() as *const u8)) {
+        proc as *mut c_void
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
-static IL2CPP: OnceLock<Option<Il2CppApi>> = OnceLock::new();
-static mut LAST_TRIGGER: Option<Instant> = None;
-const COOLDOWN: Duration = Duration::from_secs(6);
-
-fn get_il2cpp() -> Option<&'static Il2CppApi> {
-    IL2CPP.get_or_init(|| unsafe {
-        let module = LoadLibraryA(PCSTR(b"GameAssembly.dll\0".as_ptr())).ok()?;
-        macro_rules! get_fn {
-            ($name:expr) => {{
-                let c_name = CString::new($name).unwrap();
-                let addr = GetProcAddress(module, PCSTR(c_name.as_ptr() as *const u8))?;
-                std::mem::transmute(addr)
-            }};
-        }
-
-        Some(Il2CppApi {
-            domain_get: get_fn!("il2cpp_domain_get"),
-            domain_get_assemblies: get_fn!("il2cpp_domain_get_assemblies"),
-            assembly_get_image: get_fn!("il2cpp_assembly_get_image"),
-            class_from_name: get_fn!("il2cpp_class_from_name"),
-            class_get_method_from_name: get_fn!("il2cpp_class_get_method_from_name"),
-            runtime_invoke: get_fn!("il2cpp_runtime_invoke"),
-        })
-    }).as_ref()
-}
-
-pub fn check_career_stats() -> bool {
-    unsafe {
-        if let Some(last) = LAST_TRIGGER {
-            if last.elapsed() < COOLDOWN {
+pub unsafe fn check_career_stats() -> bool {
+    // 1. Cooldown Check (throttled to avoid log spam every frame)
+    if let Ok(guard) = LAST_TRIGGER.lock() {
+        if let Some(last_time) = *guard {
+            if last_time.elapsed() < Duration::from_secs(2) {
                 return false;
             }
         }
+    }
 
-        let Some(api) = get_il2cpp() else { return false; };
+    let module_name: Vec<u16> = "GameAssembly.dll\0".encode_utf16().collect();
+    let h_game_assembly = match GetModuleHandleW(windows::core::PCWSTR(module_name.as_ptr())) {
+        Ok(h) if !h.is_invalid() => h,
+        _ => return false,
+    };
 
-        let domain = (api.domain_get)();
-        if domain.is_null() { return false; }
+    let domain_get_ptr = get_il2cpp_export(h_game_assembly, "il2cpp_domain_get");
+    let domain_assembly_open_ptr = get_il2cpp_export(h_game_assembly, "il2cpp_domain_assembly_open");
+    let assembly_get_image_ptr = get_il2cpp_export(h_game_assembly, "il2cpp_assembly_get_image");
+    let class_from_name_ptr = get_il2cpp_export(h_game_assembly, "il2cpp_class_from_name");
+    let class_get_method_from_name_ptr = get_il2cpp_export(h_game_assembly, "il2cpp_class_get_method_from_name");
+    let runtime_invoke_ptr = get_il2cpp_export(h_game_assembly, "il2cpp_runtime_invoke");
+    let object_get_class_ptr = get_il2cpp_export(h_game_assembly, "il2cpp_object_get_class");
 
-        let mut size: usize = 0;
-        let assemblies = (api.domain_get_assemblies)(domain, &mut size);
-        if assemblies.is_null() { return false; }
+    if domain_get_ptr.is_null()
+        || domain_assembly_open_ptr.is_null()
+        || assembly_get_image_ptr.is_null()
+        || class_from_name_ptr.is_null()
+        || class_get_method_from_name_ptr.is_null()
+        || runtime_invoke_ptr.is_null()
+        || object_get_class_ptr.is_null()
+    {
+        api::log_warn("launch_overlay: check_career_stats: one or more il2cpp exports not resolved");
+        return false;
+    }
 
-        let mut image_ptr = std::ptr::null_mut();
-        for i in 0..size {
-            let assembly = *assemblies.add(i);
-            let img = (api.assembly_get_image)(assembly);
-            if !img.is_null() {
-                image_ptr = img;
-                break;
-            }
-        }
-        if image_ptr.is_null() { return false; }
+    let domain_get: DomainGetFn = std::mem::transmute(domain_get_ptr);
+    let domain_assembly_open: DomainAssemblyOpenFn = std::mem::transmute(domain_assembly_open_ptr);
+    let assembly_get_image: AssemblyGetImageFn = std::mem::transmute(assembly_get_image_ptr);
+    let class_from_name: ClassFromNameFn = std::mem::transmute(class_from_name_ptr);
+    let class_get_method_from_name: ClassGetMethodFromNameFn = std::mem::transmute(class_get_method_from_name_ptr);
+    let runtime_invoke: RuntimeInvokeFn = std::mem::transmute(runtime_invoke_ptr);
+    let object_get_class: ObjectGetClassFn = std::mem::transmute(object_get_class_ptr);
 
-        // Gallop.WorkDataManager
-        let gallop_ns = CString::new("Gallop").unwrap();
-        let mgr_name = CString::new("WorkDataManager").unwrap();
-        let mgr_class = (api.class_from_name)(image_ptr, gallop_ns.as_ptr(), mgr_name.as_ptr());
-        if mgr_class.is_null() { return false; }
+    let c = |s: &str| CString::new(s).unwrap();
 
-        // GetSingleMode()
-        let get_sm_name = CString::new("GetSingleMode").unwrap();
-        let get_sm_method = (api.class_get_method_from_name)(mgr_class, get_sm_name.as_ptr(), 0);
-        if get_sm_method.is_null() { return false; }
+    let domain = domain_get();
+    if domain.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: domain_get returned null");
+        return false;
+    }
 
-        let single_mode = (api.runtime_invoke)(get_sm_method, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
-        if single_mode.is_null() { return false; }
+    let assembly = domain_assembly_open(domain, c("umamusume.dll").as_ptr());
+    if assembly.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: umamusume.dll not found");
+        return false;
+    }
 
-        // GetCharacter()
-        let chara_class = (api.class_from_name)(image_ptr, gallop_ns.as_ptr(), CString::new("WorkSingleModeData").unwrap().as_ptr());
-        if chara_class.is_null() { return false; }
+    let image = assembly_get_image(assembly);
+    if image.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: assembly_get_image returned null");
+        return false;
+    }
 
-        let get_chara_method = (api.class_get_method_from_name)(chara_class, CString::new("GetCharacter").unwrap().as_ptr(), 0);
-        if get_chara_method.is_null() { return false; }
+    // Milestone 1: Reached Image
+    let work_mgr_class = class_from_name(image, c("Gallop").as_ptr(), c("WorkDataManager").as_ptr());
+    if work_mgr_class.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: class Gallop.WorkDataManager not found");
+        return false;
+    }
 
-        let chara = (api.runtime_invoke)(get_chara_method, single_mode, std::ptr::null_mut(), std::ptr::null_mut());
-        if chara.is_null() { return false; }
+    let get_instance_m = class_get_method_from_name(work_mgr_class, c("get_Instance").as_ptr(), 0);
+    if get_instance_m.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: WorkDataManager.get_Instance method not found");
+        return false;
+    }
 
-        // Read Stats
-        let chara_data_class = (api.class_from_name)(image_ptr, gallop_ns.as_ptr(), CString::new("WorkSingleModeCharaData").unwrap().as_ptr());
-        if chara_data_class.is_null() { return false; }
+    let instance = runtime_invoke(get_instance_m, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+    if instance.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: WorkDataManager.Instance is null");
+        return false;
+    }
 
-        let stat_methods = ["GetSpeed", "GetStamina", "GetPower", "GetGuts", "GetWiz"];
-        for method_name in stat_methods {
-            let c_method = CString::new(method_name).unwrap();
-            let m = (api.class_get_method_from_name)(chara_data_class, c_method.as_ptr(), 0);
-            if !m.is_null() {
-                let res = (api.runtime_invoke)(m, chara, std::ptr::null_mut(), std::ptr::null_mut());
-                if !res.is_null() {
-                    let stat_val = *(res.add(0x10) as *const i32); // Unbox IL2CPP primitive int32
-                    if stat_val.to_string().contains("67") {
-                        LAST_TRIGGER = Some(Instant::now());
-                        return true;
+    // Milestone 2: Got WorkDataManager instance
+    let get_single_m = class_get_method_from_name(work_mgr_class, c("get_SingleMode").as_ptr(), 0);
+    if get_single_m.is_null() { 
+        api::log_warn("launch_overlay: WorkDataManager.get_SingleMode method not found!");
+        return false; 
+    }
+
+    let single_mode = runtime_invoke(get_single_m, instance, std::ptr::null_mut(), std::ptr::null_mut());
+    if single_mode.is_null() {
+        // This means you are on the title screen or main menu (not inside career mode yet)
+        api::log_warn("launch_overlay: check_career_stats: get_SingleMode returned null (not in career?)");
+        return false;
+    }
+
+    // Milestone 3: Got WorkSingleModeData!
+    let single_mode_class = object_get_class(single_mode);
+    let get_chara_m = class_get_method_from_name(single_mode_class, c("get_Character").as_ptr(), 0);
+    if get_chara_m.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: WorkSingleModeData.get_Character method not found");
+        return false;
+    }
+
+    let chara = runtime_invoke(get_chara_m, single_mode, std::ptr::null_mut(), std::ptr::null_mut());
+    if chara.is_null() {
+        api::log_warn("launch_overlay: check_career_stats: get_Character returned null");
+        return false;
+    }
+
+    // Milestone 4: Got Character Data!
+    let chara_class = object_get_class(chara);
+    let stat_methods = ["get_Speed", "get_Stamina", "get_Power", "get_Guts", "get_Wiz"];
+
+    for method_name in stat_methods {
+        let method = class_get_method_from_name(chara_class, c(method_name).as_ptr(), 0);
+        if !method.is_null() {
+            let res = runtime_invoke(method, chara, std::ptr::null_mut(), std::ptr::null_mut());
+            if !res.is_null() {
+                let stat_val = *(res.add(0x10) as *const i32);
+
+                api::log_info(&format!("launch_overlay: Checked {}: {}", method_name, stat_val));
+
+                if stat_val.to_string().contains("67") {
+                    api::log_info(&format!("launch_overlay: Triggered on {} = {}", method_name, stat_val));
+                    if let Ok(mut guard) = LAST_TRIGGER.lock() {
+                        *guard = Some(Instant::now());
                     }
+                    return true;
                 }
             }
         }
     }
+
     false
 }
